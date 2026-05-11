@@ -1,0 +1,102 @@
+name: Build and Deploy Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - "releases/**"
+    tags:
+      - "v*"
+    paths-ignore:
+      - helm/flask-app/values-green.yaml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Debug event
+        run: |
+          echo "EVENT=$GITHUB_EVENT_NAME"
+          echo "REF=$GITHUB_REF"
+          echo "REF_NAME=$GITHUB_REF_NAME"
+          echo "REF_TYPE=$GITHUB_REF_TYPE"
+
+      # --------------------------------
+      # PYTHON + PYTEST
+      # --------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install dependencies
+        run: poetry install --no-root
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=." >> $GITHUB_ENV
+      - name: Run tests
+        run: poetry run pytest
+
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set image tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ "$GITHUB_REF" == refs/heads/releases/* ]]; then
+            VERSION="${GITHUB_REF_NAME#releases/}"
+            IMAGE_TAG="v${VERSION}"
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            IMAGE_TAG="${GITHUB_SHA::8}"
+          else
+            IMAGE_TAG="${GITHUB_REF_NAME//\//-}"
+          fi
+
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "Release image tag: $IMAGE_TAG"
+
+      - name: Build Docker image
+        run: |
+          docker build -t lumuma2025/techwave_web_k8s:${IMAGE_TAG} -f docker/Dockerfile .
+
+      - name: Push Docker image
+        run: |
+          docker push lumuma2025/techwave_web_k8s:${IMAGE_TAG}
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update Helm values.yaml
+        run: |
+          yq -i '.image.tag = strenv(IMAGE_TAG)' helm/flask-app/values-green.yaml
+
+      - name: Debug values file
+        run: cat helm/flask-app/values-green.yaml
+
+      - name: Commit and push updated values.yaml
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config user.name "luismuma"
+          git config user.email "luismuma@users.noreply.github.com"
+
+          git remote set-url origin https://x-access-token:${GH_PAT}@github.com/luismuma/techwave_web_K8s.git
+
+          git add helm/flask-app/values-green.yaml
+          git commit -m "chore: update image tag to ${IMAGE_TAG} [ci skip]" || exit 0
+          git push origin HEAD:main
